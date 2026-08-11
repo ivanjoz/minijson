@@ -1,0 +1,31 @@
+{
+  "name": "@ivanjoz/minijson",
+  "version": "0.1.0",
+  "description": "TypeScript decoder for minijson's compact JSON array format",
+  "type": "module",
+  "types": "./javascript/index.ts",
+  "exports": {
+    ".": {
+      "types": "./javascript/index.ts",
+      "import": "./javascript/index.ts",
+      "default": "./javascript/index.ts"
+    }
+  },
+  "files": [
+    "javascript/index.ts",
+    "javascript/minijson.ts",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "bun test javascript"
+  },
+  "keywords": [
+    "json",
+    "serialization",
+    "compact-json",
+    "go",
+    "typescript"
+  ],
+  "license": "GPL-3.0-only"
+}
