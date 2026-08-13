@@ -279,6 +279,18 @@ func (e *Encoder) appendKeysList(dst []byte) []byte {
 			dst = appendJSONString(dst, typeInfo.Fields[fieldIdx].Name)
 		}
 
+		// The defaults block goes last and is a JSON object, which is what makes it invisible to a
+		// decoder that predates it: both the TypeScript and the Go header parsers walk (position,
+		// name) pairs from index 1 and stop at the last complete pair, so a lone trailing element
+		// is never read. Putting it up front instead would shift the pair parity and corrupt every
+		// older client. It has to be built from the type rather than from usage.mask, because the
+		// fields that need a default most are exactly the ones the mask leaves out: a field that
+		// was zero in every record of the payload gets no position in the header at all.
+		if e.includeEmpty && len(typeInfo.DefaultsBlock) > 0 {
+			dst = append(dst, ',')
+			dst = append(dst, typeInfo.DefaultsBlock...)
+		}
+
 		dst = append(dst, ']')
 		wroteEntry = true
 	}

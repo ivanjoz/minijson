@@ -12,13 +12,17 @@ type Encoder struct {
 	// typeUsage holds this payload's per-type field usage. Encoder-local, so two concurrent
 	// Marshal calls cannot corrupt each other's keys header.
 	typeUsage map[int]*encoderTypeUsage
+	// includeEmpty is captured once per Encoder rather than read per type, so a payload is
+	// never half-encoded with the defaults block and half without it.
+	includeEmpty bool
 }
 
 func NewEncoder() *Encoder {
 	return &Encoder{
-		registry:  globalRegistry,
-		seen:      make(map[uintptr]bool),
-		typeUsage: make(map[int]*encoderTypeUsage),
+		registry:     globalRegistry,
+		seen:         make(map[uintptr]bool),
+		typeUsage:    make(map[int]*encoderTypeUsage),
+		includeEmpty: IncludeEmpty(),
 	}
 }
 

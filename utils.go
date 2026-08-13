@@ -16,6 +16,10 @@ type FieldInfo struct {
 	Name    string // JSON tag name or field name
 	RawName string // Original field name (without JSON tag)
 	Ignored bool   // Whether the field is omitted (json:"-")
+	// OmitEmpty reports whether the json tag carries the omitempty option. It does not change
+	// what is written to the wire — zero values are always omitted — it selects which fields get
+	// an entry in the keys header's defaults block. See defaults.go.
+	OmitEmpty bool
 }
 
 // TypeInfo stores metadata for a registered type.
@@ -36,6 +40,10 @@ type TypeInfo struct {
 	// DefaultOrder lists the non-ignored field indices in declaration order. Precomputed so a
 	// type that has not been optimized yet does not rebuild this slice for every record.
 	DefaultOrder []int
+	// DefaultsBlock is the rendered {"field":<zero>,...} object for this type's non-omitempty
+	// fields, appended to the type's keys header entry when IncludeEmpty is on. Nil when the
+	// type has no such field. Built here so emitting it never costs more than a byte copy.
+	DefaultsBlock []byte
 	// OptimizedOrder / IsOptimized are written once under the registry lock and read-only after.
 	OptimizedOrder []int
 	IsOptimized    bool
@@ -62,25 +70,27 @@ func NewFieldRegistry() *FieldRegistry {
 	}
 }
 
-// getFieldName extracts the JSON tag name or falls back to the field name
-func getFieldName(field reflect.StructField) string {
+// parseFieldTag extracts the JSON tag name, falling back to the field name, along with whether the
+// tag carries the omitempty option. Returns "-" as the name for an ignored field.
+func parseFieldTag(field reflect.StructField) (string, bool) {
 	jsonTag := field.Tag.Get("json")
 	if jsonTag == "-" {
-		return "-"
+		return "-", false
 	}
 	if jsonTag == "" {
-		return field.Name
+		return field.Name, false
 	}
 	// Handle "name,omitempty" format
 	if idx := strings.Index(jsonTag, ","); idx != -1 {
 		name := jsonTag[:idx]
+		omitEmpty := strings.Contains(jsonTag[idx+1:], "omitempty")
 		// If name is empty (e.g., ",omitempty"), use the struct field name
 		if name == "" {
-			return field.Name
+			return field.Name, omitEmpty
 		}
-		return name
+		return name, omitEmpty
 	}
-	return jsonTag
+	return jsonTag, false
 }
 
 func (r *FieldRegistry) GetID(t reflect.Type) int {
@@ -99,16 +109,17 @@ func (r *FieldRegistry) GetID(t reflect.Type) int {
 
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
-		name := getFieldName(sf)
+		name, omitEmpty := parseFieldTag(sf)
 		ignored := name == "-"
 		if ignored {
 			name = sf.Name // Keep a name for debug, but mark ignored
 		}
 		fields[i] = FieldInfo{
-			Index:   i,
-			Name:    name,
-			RawName: sf.Name,
-			Ignored: ignored,
+			Index:     i,
+			Name:      name,
+			RawName:   sf.Name,
+			Ignored:   ignored,
+			OmitEmpty: omitEmpty,
 		}
 		if !ignored {
 			defaultOrder = append(defaultOrder, i)
@@ -116,11 +127,12 @@ func (r *FieldRegistry) GetID(t reflect.Type) int {
 	}
 
 	r.idToInfo[id] = &TypeInfo{
-		ID:           id,
-		Type:         t,
-		XStruct:      xStruct,
-		Fields:       fields,
-		DefaultOrder: defaultOrder,
+		ID:            id,
+		Type:          t,
+		XStruct:       xStruct,
+		Fields:        fields,
+		DefaultOrder:  defaultOrder,
+		DefaultsBlock: buildDefaultsBlock(t),
 	}
 	return id
 }

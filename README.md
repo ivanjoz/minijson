@@ -16,13 +16,13 @@ The Go package provides encoding and typed decoding. The `@ivanjoz/minijson` pac
 Go:
 
 ```sh
-go get github.com/ivanjoz/minijson@v0.1.0
+go get github.com/ivanjoz/minijson@v0.2.0
 ```
 
 TypeScript from GitHub:
 
 ```sh
-bun add @ivanjoz/minijson@github:ivanjoz/minijson#v0.1.0
+bun add @ivanjoz/minijson@github:ivanjoz/minijson#v0.2.0
 ```
 
 ## Go usage
@@ -82,6 +82,24 @@ Every payload is `[keys, content]`:
 - Struct reference blocks carry skipped positions for zero-valued fields.
 
 The format is self-describing for the TypeScript decoder. Go decoding uses the destination's concrete struct types to restore typed values.
+
+## Zero values and `MINIJSON_INCLUDE_EMPTY`
+
+Zero values never travel, whether or not the field's `json` tag has `omitempty`. Go's `Unmarshal` hides that because it repopulates each field from the destination struct, but a decoder without types cannot: the field is simply absent, so `0`, `""` and `false` read back as `undefined` in the browser.
+
+Set `MINIJSON_INCLUDE_EMPTY=1` (or call `minijson.SetIncludeEmpty(true)`) and each type's keys entry gains a trailing object describing the zero value of its non-`omitempty` fields:
+
+```text
+[1, 0, "id", 1, "codigo", {"id":0,"codigo":"","cantidad":0,"activo":false}]
+```
+
+The TypeScript decoder uses it to reconstruct the exact object `encoding/json` would have produced. Fields tagged `omitempty` are left out on purpose — `encoding/json` would have dropped them too.
+
+The block costs one object per type per payload, not per record: 2000 records of a 10-field struct grow by 114 bytes. It is appended last and is the only object in an entry, and both header parsers read `(position, name)` pairs and stop at the last complete one, so a decoder that predates the block ignores it. Old and new clients can therefore be mixed while the flag is switched.
+
+### Known limitations
+
+`Marshal` does not honour `json.Marshaler` and does not skip unexported fields, so a `time.Time` field is written as its private internals rather than an RFC 3339 string, and typed decoding of one panics inside `reflect`. `TestTimeTimeIsMangled` pins this. Defaults inherit the same gap: the default for a `time.Time` field is `{}`.
 
 ## Development
 
