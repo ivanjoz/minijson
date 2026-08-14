@@ -141,7 +141,14 @@ func (e *Encoder) marshalStruct(val reflect.Value) ([]any, error) {
 	lastNonZeroIdx := -1
 
 	for orderIdx, fieldIdx := range fieldOrder {
-		fVal := val.Field(fieldIdx).Interface()
+		// Fields are the promoted ones, so this walks an index path rather than a single index; an
+		// invalid Value means the path crossed a nil embedded pointer and the field carries nothing.
+		fieldValue := fieldByIndexPath(val, typeInfo.Fields[fieldIdx].IndexPath)
+		if !fieldValue.IsValid() {
+			fieldDataList[orderIdx] = fieldData{orderIdx: orderIdx, isZero: true}
+			continue
+		}
+		fVal := fieldValue.Interface()
 
 		if isZero(fVal) {
 			fieldDataList[orderIdx] = fieldData{orderIdx: orderIdx, isZero: true}

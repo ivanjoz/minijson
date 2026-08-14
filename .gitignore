@@ -1,0 +1,3 @@
+# Binarios y perfiles que dejan `go test -c` / -cpuprofile
+*.test
+*.prof

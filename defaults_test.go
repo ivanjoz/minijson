@@ -413,35 +413,68 @@ type conFechaValor struct {
 	Fecha time.Time `json:"fecha"`
 }
 
-// KNOWN LIMITATION, pre-existing and independent of the defaults block.
+// time.Time is the type that exposed the whole marshaler gap: all of its fields are unexported, so
+// walking it structurally produces either its private internals (`wall`, `ext`, the entirety of
+// `loc`) or, once unexported fields are skipped, an empty object with the date silently gone. Typed
+// decoding of the first form panicked inside reflect.
 //
-// minijson's encoder does not honour json.Marshaler and does not skip unexported fields, so a
-// time.Time field is written as its private internals instead of an RFC 3339 string, and typed
-// decoding of it panics inside reflect. This test pins that behaviour so the day it is fixed the
-// fix is deliberate rather than accidental — and so the divergence is discoverable from the tests
-// rather than from a broken screen.
-//
-// Consequence for the defaults block: the default for a time.Time field is `{}`, since the type
-// has no exported field. That is wrong in the same way the value path is wrong, not more.
-func TestTimeTimeIsMangled(t *testing.T) {
-	registros := []conFechaValor{{ID: 1, Fecha: time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)}}
+// It now travels through time.Time's own MarshalJSON, which is what encoding/json does. This test
+// pins the value, the round trip and the default, because each of the three was broken differently.
+func TestTimeTimeRoundTripsAsRFC3339(t *testing.T) {
+	instante := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	registros := []conFechaValor{{ID: 1, Fecha: instante}}
 
 	payload, err := Marshal(registros)
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	if strings.Contains(string(payload), "2026-08-13T10:00:00Z") {
-		t.Fatalf("time.Time now round-trips as RFC 3339 — update this test and the notes in "+
-			"defaults.go, the limitation is fixed: %s", payload)
+	if !strings.Contains(string(payload), `"2026-08-13T10:00:00Z"`) {
+		t.Fatalf("the date is not on the wire as RFC 3339: %s", payload)
+	}
+	// None of time.Time's private fields may appear.
+	for _, interno := range []string{`"wall"`, `"ext"`, `"loc"`} {
+		if strings.Contains(string(payload), interno) {
+			t.Fatalf("time.Time's internals leaked into the payload (%s): %s", interno, payload)
+		}
 	}
 
 	var decodificado []conFechaValor
-	panico := func() (recovered any) {
-		defer func() { recovered = recover() }()
-		_ = Unmarshal(payload, &decodificado)
-		return nil
-	}()
-	if panico == nil {
-		t.Fatal("typed decoding of a time.Time field no longer panics — update this test")
+	if err := Unmarshal(payload, &decodificado); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(decodificado) != 1 {
+		t.Fatalf("decoded %d records, expected 1", len(decodificado))
+	}
+	if !decodificado[0].Fecha.Equal(instante) {
+		t.Fatalf("the date did not survive the round trip: %v, expected %v", decodificado[0].Fecha, instante)
+	}
+}
+
+// And the default for a time.Time field is the zero rendered through the same marshaler, which is
+// what encoding/json writes for a zero time.
+func TestDefaultsBlockUsesMarshalerForZeroTime(t *testing.T) {
+	SetIncludeEmpty(true)
+	defer SetIncludeEmpty(false)
+
+	payload, err := Marshal([]conFechaValor{{ID: 1}})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	block := defaultsOf(t, payload)
+	if block == nil {
+		t.Fatalf("no defaults block: %s", payload)
+	}
+
+	referencia, err := json.Marshal(conFechaValor{})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var esperado map[string]any
+	if err := json.Unmarshal(referencia, &esperado); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if block["fecha"] != esperado["fecha"] {
+		t.Fatalf("default de \"fecha\" = %#v, encoding/json emite %#v", block["fecha"], esperado["fecha"])
 	}
 }

@@ -26,8 +26,28 @@ import (
 // (business/types.Product, ~36 fields) so the common path never allocates.
 const maxStackFields = 96
 
-// appendValue writes val's compact representation into dst and returns the extended slice.
+// appendValue writes val's compact representation into dst and returns the extended slice, resolving
+// per value whether the type renders itself. Use it only where the static type is unknown — the top
+// level of a payload, or an interface-typed field. Everywhere else the decision is already resolved
+// against the static type, and appendWith spends nothing on it.
 func (e *Encoder) appendValue(dst []byte, val reflect.Value) ([]byte, error) {
+	return e.appendValueResolved(dst, val, true, nil)
+}
+
+// appendWith writes a value using an encoding decision already resolved for its static type, which
+// is what keeps marshaler support off the hot path entirely.
+func (e *Encoder) appendWith(dst []byte, val reflect.Value, codec *staticCodec) ([]byte, error) {
+	if codec.flags.needsMarshaler {
+		return appendViaMarshaler(dst, val, codec.flags)
+	}
+	// A dynamic (interface) static type has to be resolved per value; anything else is settled.
+	return e.appendValueResolved(dst, val, codec.dynamic, codec.elem)
+}
+
+// appendValueResolved writes a value. resolveMarshaler asks it to work out for itself whether the
+// type renders itself, which only the callers without a static type need. elemCodec is the
+// pre-resolved decision for a collection's elements, or nil to work that out on the spot.
+func (e *Encoder) appendValueResolved(dst []byte, val reflect.Value, resolveMarshaler bool, elemCodec *staticCodec) ([]byte, error) {
 	if !val.IsValid() {
 		return append(dst, "null"...), nil
 	}
@@ -48,13 +68,22 @@ func (e *Encoder) appendValue(dst []byte, val reflect.Value) ([]byte, error) {
 		return append(dst, "null"...), nil
 	}
 
+	// A type that defines its own JSON representation gets it, in preference to being taken apart
+	// structurally. Checked after the deref loop so it also catches a marshaler reached through a
+	// pointer or an interface. See codec.go.
+	if resolveMarshaler {
+		if flags := marshalerFor(val.Type()); flags.needsMarshaler {
+			return appendViaMarshaler(dst, val, flags)
+		}
+	}
+
 	switch val.Kind() {
 	case reflect.Struct:
 		return e.appendStruct(dst, val)
 	case reflect.Slice, reflect.Array:
-		return e.appendSlice(dst, val)
+		return e.appendSlice(dst, val, elemCodec)
 	case reflect.Map:
-		return e.appendMap(dst, val)
+		return e.appendMap(dst, val, elemCodec)
 	}
 
 	return appendScalar(dst, val)
@@ -92,10 +121,16 @@ func (e *Encoder) appendStruct(dst []byte, val reflect.Value) ([]byte, error) {
 
 	usage := e.usageFor(typeID, typeInfo)
 	fieldOrder := usage.order
+	fields := typeInfo.Fields
 
 	// Zero-detection has to finish before any value is written, because the skip block precedes
 	// the values on the wire. Backed by a stack array so nested structs each get their own —
 	// a shared scratch buffer on the Encoder would be clobbered by recursion.
+	//
+	// Resolved field values are deliberately NOT cached alongside: a [96]reflect.Value costs 2.3 KB
+	// that the runtime has to zero on every call, because reflect.Value holds pointers. Measured at
+	// a 20% regression on the encoder — far more than re-resolving each field, which is a couple of
+	// nanoseconds.
 	var zeroFieldsArray [maxStackFields]bool
 	var zeroFields []bool
 	if len(fieldOrder) <= maxStackFields {
@@ -106,7 +141,10 @@ func (e *Encoder) appendStruct(dst []byte, val reflect.Value) ([]byte, error) {
 
 	lastNonZeroIdx := -1
 	for orderIdx, fieldIdx := range fieldOrder {
-		if val.Field(fieldIdx).IsZero() {
+		fieldValue := fieldValueOf(val, &fields[fieldIdx])
+		// An invalid Value means the path crossed a nil embedded pointer, so the promoted field
+		// carries nothing — treated exactly like a zero value.
+		if !fieldValue.IsValid() || fieldValue.IsZero() {
 			zeroFields[orderIdx] = true
 			continue
 		}
@@ -160,7 +198,7 @@ func (e *Encoder) appendStruct(dst []byte, val reflect.Value) ([]byte, error) {
 		dst = append(dst, ",["...)
 		dst = appendSkipIndices(dst, false)
 		dst = append(dst, ']')
-	} else if lastNonZeroIdx >= 0 && encodesAsArray(val.Field(fieldOrder[0])) {
+	} else if lastNonZeroIdx >= 0 && encodesAsArray(fieldValueOf(val, &fields[fieldOrder[0]])) {
 		// No skips, and the first value is an array: emit an empty skip block so position 1 is
 		// always the skip list when it is an array, which is the invariant both decoders rely on.
 		dst = append(dst, ",[]"...)
@@ -173,7 +211,8 @@ func (e *Encoder) appendStruct(dst []byte, val reflect.Value) ([]byte, error) {
 		dst = append(dst, ',')
 
 		var err error
-		dst, err = e.appendValue(dst, val.Field(fieldOrder[orderIdx]))
+		field := &fields[fieldOrder[orderIdx]]
+		dst, err = e.appendWith(dst, fieldValueOf(val, field), &field.codec)
 		if err != nil {
 			return nil, err
 		}
@@ -182,14 +221,21 @@ func (e *Encoder) appendStruct(dst []byte, val reflect.Value) ([]byte, error) {
 	return append(dst, ']'), nil
 }
 
-func (e *Encoder) appendSlice(dst []byte, val reflect.Value) ([]byte, error) {
+func (e *Encoder) appendSlice(dst []byte, val reflect.Value, elemCodec *staticCodec) ([]byte, error) {
 	dst = append(dst, "[2"...)
+
+	// Every element shares the slice's element type, so the decision is resolved for the whole
+	// slice. Normally the caller already has it from the field's type and this costs nothing.
+	if elemCodec == nil {
+		resolved := staticCodecFor(val.Type().Elem())
+		elemCodec = &resolved
+	}
 
 	for i := range val.Len() {
 		dst = append(dst, ',')
 
 		var err error
-		dst, err = e.appendValue(dst, val.Index(i))
+		dst, err = e.appendWith(dst, val.Index(i), elemCodec)
 		if err != nil {
 			return nil, err
 		}
@@ -198,7 +244,7 @@ func (e *Encoder) appendSlice(dst []byte, val reflect.Value) ([]byte, error) {
 	return append(dst, ']'), nil
 }
 
-func (e *Encoder) appendMap(dst []byte, val reflect.Value) ([]byte, error) {
+func (e *Encoder) appendMap(dst []byte, val reflect.Value, valueCodec *staticCodec) ([]byte, error) {
 	dst = append(dst, "[3"...)
 
 	// Keys are stringified and sorted so the same map always serializes identically.
@@ -216,13 +262,18 @@ func (e *Encoder) appendMap(dst []byte, val reflect.Value) ([]byte, error) {
 		return sortedKeys[i].text < sortedKeys[j].text
 	})
 
+	if valueCodec == nil {
+		resolved := staticCodecFor(val.Type().Elem())
+		valueCodec = &resolved
+	}
+
 	for _, sortedKey := range sortedKeys {
 		dst = append(dst, ',')
 		dst = appendJSONString(dst, sortedKey.text)
 		dst = append(dst, ',')
 
 		var err error
-		dst, err = e.appendValue(dst, val.MapIndex(sortedKey.value))
+		dst, err = e.appendWith(dst, val.MapIndex(sortedKey.value), valueCodec)
 		if err != nil {
 			return nil, err
 		}

@@ -5,7 +5,6 @@ import (
 	"reflect"
 
 	"github.com/bytedance/sonic"
-	"github.com/viant/xunsafe"
 )
 
 type Decoder struct {
@@ -81,12 +80,12 @@ func (d *Decoder) parseKeysHeader(rawKeys any) (map[int][]int, error) {
 			return nil, fmt.Errorf("keys header references unknown type ID: %d", typeID)
 		}
 
-		// Resolve names against this type once per header entry rather than per record.
+		// Resolve names against this type once per header entry rather than per record. The names
+		// are the promoted ones, so a field declared in an embedded struct resolves here under the
+		// name it travels as, not under the embedded type's name.
 		fieldIndexByName := make(map[string]int, len(typeInfo.Fields))
 		for i, field := range typeInfo.Fields {
-			if !field.Ignored {
-				fieldIndexByName[field.Name] = i
-			}
+			fieldIndexByName[field.Name] = i
 		}
 
 		fieldOrder := []int{}
@@ -125,6 +124,13 @@ func (d *Decoder) unmarshalValue(data any, val reflect.Value) error {
 	if data == nil {
 		val.Set(reflect.Zero(val.Type()))
 		return nil
+	}
+
+	// A type that defines its own JSON representation restores through it, mirroring the encoder.
+	// Struct fields skip this lookup entirely — populateStruct passes the flags resolved at type
+	// registration — so it is only reached for the top level, collection elements and map values.
+	if flags := unmarshalerFor(val.Type()); flags.needsUnmarshler && val.CanAddr() {
+		return unmarshalViaCodec(data, val, flags)
 	}
 
 	arr, ok := data.([]any)
@@ -192,7 +198,6 @@ func (d *Decoder) unmarshalMap(arr []any, val reflect.Value) error {
 
 func (d *Decoder) unmarshalStruct(arr []any, val reflect.Value) error {
 	header := int(arr[0].(float64))
-	var xStruct *xunsafe.Struct
 	var skipIndices []int
 	var valueStartIdx int
 	var typeID int
@@ -206,8 +211,7 @@ func (d *Decoder) unmarshalStruct(arr []any, val reflect.Value) error {
 			return fmt.Errorf("invalid reference block")
 		}
 		typeID = int(refBlock[0].(float64))
-		xStruct = d.registry.GetStruct(typeID)
-		if xStruct == nil {
+		if d.registry.GetTypeInfo(typeID) == nil {
 			return fmt.Errorf("unknown type ID: %d", typeID)
 		}
 		d.lastType = d.registry.GetType(typeID)
@@ -222,7 +226,6 @@ func (d *Decoder) unmarshalStruct(arr []any, val reflect.Value) error {
 			return fmt.Errorf("header 0 but no previous type")
 		}
 		typeID = d.lastTypeID
-		xStruct = xunsafe.NewStruct(d.lastType)
 
 		// The encoder guarantees that position 1 of a header-0 record is the skip
 		// block whenever it is an array (emitting an empty one when the first value
@@ -241,7 +244,7 @@ func (d *Decoder) unmarshalStruct(arr []any, val reflect.Value) error {
 	if val.Kind() != reflect.Struct {
 		if val.Kind() == reflect.Interface {
 			newVal := reflect.New(d.lastType).Elem()
-			err := d.populateStruct(xStruct, typeID, arr[valueStartIdx:], skipIndices, newVal)
+			err := d.populateStruct(typeID, arr[valueStartIdx:], skipIndices, newVal)
 			if err != nil {
 				return err
 			}
@@ -253,15 +256,20 @@ func (d *Decoder) unmarshalStruct(arr []any, val reflect.Value) error {
 			if val.IsNil() {
 				val.Set(reflect.New(d.lastType))
 			}
-			return d.populateStruct(xStruct, typeID, arr[valueStartIdx:], skipIndices, val.Elem())
+			return d.populateStruct(typeID, arr[valueStartIdx:], skipIndices, val.Elem())
 		}
 		return fmt.Errorf("cannot unmarshal struct into %v", val.Type())
 	}
 
-	return d.populateStruct(xStruct, typeID, arr[valueStartIdx:], skipIndices, val)
+	return d.populateStruct(typeID, arr[valueStartIdx:], skipIndices, val)
 }
 
-func (d *Decoder) populateStruct(xStruct *xunsafe.Struct, typeID int, values []any, skipIndices []int, val reflect.Value) error {
+func (d *Decoder) populateStruct(typeID int, values []any, skipIndices []int, val reflect.Value) error {
+	typeInfo := d.registry.GetTypeInfo(typeID)
+	if typeInfo == nil {
+		return fmt.Errorf("unknown type ID: %d", typeID)
+	}
+
 	skipMap := make(map[int]bool)
 	for _, idx := range skipIndices {
 		skipMap[idx] = true
@@ -275,7 +283,7 @@ func (d *Decoder) populateStruct(xStruct *xunsafe.Struct, typeID int, values []a
 		if registryOrder != nil {
 			fieldOrder = registryOrder
 		} else {
-			for i := range xStruct.Fields {
+			for i := range typeInfo.Fields {
 				fieldOrder = append(fieldOrder, i)
 			}
 		}
@@ -290,19 +298,31 @@ func (d *Decoder) populateStruct(xStruct *xunsafe.Struct, typeID int, values []a
 			break
 		}
 		// A header position with no resolvable field still consumes its value slot.
-		if fieldIdx < 0 {
+		if fieldIdx < 0 || fieldIdx >= len(typeInfo.Fields) {
 			valueIdx++
 			continue
 		}
 
-		field := &xStruct.Fields[fieldIdx]
+		field := &typeInfo.Fields[fieldIdx]
+		// Resolve the destination before decoding into it: a promoted field may sit behind a nil
+		// embedded pointer that has to be allocated first, and an unsettable one has nowhere to go.
+		target, settable := fieldByIndexPathAlloc(val, field.IndexPath)
+		if !settable {
+			valueIdx++
+			continue
+		}
+
 		fVal := reflect.New(field.Type).Elem()
-		err := d.unmarshalValue(values[valueIdx], fVal)
-		if err != nil {
+		if field.decoder.needsUnmarshler {
+			// Resolved at registration, so the per-record path never repeats the interface checks.
+			if err := unmarshalViaCodec(values[valueIdx], fVal, field.decoder); err != nil {
+				return err
+			}
+		} else if err := d.unmarshalValue(values[valueIdx], fVal); err != nil {
 			return err
 		}
 
-		val.Field(fieldIdx).Set(fVal)
+		target.Set(fVal)
 		valueIdx++
 	}
 	return nil

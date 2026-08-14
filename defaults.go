@@ -42,41 +42,36 @@ func SetIncludeEmpty(enabled bool) { includeEmpty.Store(enabled) }
 
 // buildDefaultsBlock renders the JSON object of zero-value defaults for a type, or nil when the
 // type has no field that needs one.
-func buildDefaultsBlock(t reflect.Type) []byte {
-	block := appendZeroStruct(make([]byte, 0, 64), t)
-	if len(block) == 2 { // "{}" — every field is ignored, unexported or omitempty.
+//
+// It takes the type's already-promoted field list rather than the reflect.Type, so the block can
+// never disagree with what the value path writes: both walk the same fields under the same names.
+func buildDefaultsBlock(fields []FieldInfo) []byte {
+	block := appendZeroFields(make([]byte, 0, 64), fields)
+	if len(block) == 2 { // "{}" — every field is unexported, ignored or omitempty.
 		return nil
 	}
 	return block
 }
 
-// appendZeroStruct writes {"field":<zero>,...} for a struct type's exported, non-ignored,
-// non-omitempty fields.
-//
-// Unexported fields are skipped even though the value path does emit them (see the note in
-// appendZeroDefault): their names are implementation details that no consumer can use.
-//
-// A field whose default renders as an empty object is dropped rather than written. That is what
-// keeps an embedded marker struct out of the block: bun.BaseModel is exported, anonymous and has
-// no fields, so without this rule every table-backed type would grow a `"BaseModel":{}` key that
-// encoding/json never emitted and no client has ever seen. The same rule covers any nested struct
-// with nothing to reconstruct.
-//
-// Note that anonymous fields are treated as ordinary named fields rather than promoted the way
-// encoding/json promotes them. That is deliberate: minijson's value path does not promote them
-// either, so a non-empty embedded struct arrives nested under its type name when it carries a
-// value, and its default has to be shaped the same way to match.
+// appendZeroStruct writes {"field":<zero>,...} for a nested struct type, promoting its embedded
+// structs the same way the top level does.
 func appendZeroStruct(dst []byte, t reflect.Type) []byte {
+	return appendZeroFields(dst, promotedFields(t))
+}
+
+// appendZeroFields writes {"field":<zero>,...} for the non-omitempty entries of a promoted field
+// list. Fields tagged `omitempty` are left out: encoding/json would have dropped them too, so a
+// missing key is the correct result.
+//
+// A field whose default renders as an empty object is dropped rather than written, which covers any
+// nested struct with nothing to reconstruct.
+func appendZeroFields(dst []byte, fields []FieldInfo) []byte {
 	dst = append(dst, '{')
 
 	wroteField := false
-	for i := 0; i < t.NumField(); i++ {
-		structField := t.Field(i)
-		if structField.PkgPath != "" { // unexported
-			continue
-		}
-		name, omitEmpty := parseFieldTag(structField)
-		if name == "-" || omitEmpty {
+	for i := range fields {
+		field := &fields[i]
+		if field.OmitEmpty {
 			continue
 		}
 
@@ -84,11 +79,11 @@ func appendZeroStruct(dst []byte, t reflect.Type) []byte {
 		if wroteField {
 			dst = append(dst, ',')
 		}
-		dst = appendJSONString(dst, name)
+		dst = appendJSONString(dst, field.Name)
 		dst = append(dst, ':')
 
 		valueStart := len(dst)
-		dst = appendZeroDefault(dst, structField.Type)
+		dst = appendZeroDefault(dst, field.Type)
 		if len(dst)-valueStart == 2 && dst[valueStart] == '{' {
 			dst = dst[:fieldStart] // rolls back the separator too
 			continue
@@ -113,10 +108,19 @@ func appendZeroStruct(dst []byte, t reflect.Type) []byte {
 //     reference through a pointer stops at `null`.
 //   - a zero array marshals to its elements, so it recurses too.
 //
-// Two known divergences, both inherited from the value path rather than introduced here:
-// encoding/json honours json.Marshaler and skips unexported fields, and minijson's encoder does
-// neither. A time.Time field is the case that matters in practice — see TestTimeTimeIsMangled.
+// A type carrying its own JSON representation short-circuits all of that: its zero is rendered
+// through its own MarshalJSON/MarshalText, which is what makes a time.Time field default to
+// "0001-01-01T00:00:00Z" instead of to the empty object its unexported fields would produce.
 func appendZeroDefault(dst []byte, t reflect.Type) []byte {
+	// A type with its own JSON representation gets its zero rendered through it, so a time.Time
+	// field defaults to "0001-01-01T00:00:00Z" rather than to an empty object.
+	if marshalerFor(t).needsMarshaler {
+		if raw := zeroMarshalerDefault(t); raw != nil {
+			return append(dst, raw...)
+		}
+		return append(dst, "null"...)
+	}
+
 	switch t.Kind() {
 	case reflect.Bool:
 		return append(dst, "false"...)

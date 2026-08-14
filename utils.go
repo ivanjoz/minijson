@@ -6,20 +6,39 @@ import (
 	"sort"
 	"strings"
 	"sync"
-
-	"github.com/viant/xunsafe"
 )
 
-// FieldInfo stores metadata for a struct field
+// FieldInfo stores metadata for one serializable field of a type.
+//
+// "Serializable" means the field survived promotion: unexported fields and `json:"-"` fields are
+// absent from TypeInfo.Fields entirely, and the fields of an anonymous embedded struct appear here
+// in their own right rather than under the embedded type's name. See fields.go.
 type FieldInfo struct {
-	Index   int    // Original field index in the struct
+	Index   int    // Position in TypeInfo.Fields, i.e. this field's own index
 	Name    string // JSON tag name or field name
 	RawName string // Original field name (without JSON tag)
-	Ignored bool   // Whether the field is omitted (json:"-")
 	// OmitEmpty reports whether the json tag carries the omitempty option. It does not change
 	// what is written to the wire — zero values are always omitted — it selects which fields get
 	// an entry in the keys header's defaults block. See defaults.go.
 	OmitEmpty bool
+	// IndexPath locates the field inside the type: length 1 for a directly declared field, longer
+	// for one promoted out of an embedded struct. Walk it with fieldByIndexPath.
+	IndexPath []int
+	// Type is the field's own type, cached so decoding never has to re-resolve it per record.
+	Type reflect.Type
+
+	// direct is IndexPath[0] when the path has a single element, or -1 when the field is promoted
+	// and needs the full walk. Lets the encoder's inner loop reach a directly declared field with a
+	// plain val.Field, which is the overwhelmingly common case.
+	direct int
+	// codec is the field type's encoding decision, resolved here so it is never repeated per record.
+	codec staticCodec
+	// decoder is the matching decode-side decision.
+	decoder codecFlags
+
+	// depth and tagged only feed promotion's conflict resolution; see resolveConflicts.
+	depth  int
+	tagged bool
 }
 
 // TypeInfo stores metadata for a registered type.
@@ -33,12 +52,14 @@ type FieldInfo struct {
 // Marshal run a single pass. Freezing is safe because the order is transmitted in the payload's
 // keys header on every response, so the decoder never depends on the encoder's history.
 type TypeInfo struct {
-	ID      int
-	Type    reflect.Type
-	XStruct *xunsafe.Struct
-	Fields  []FieldInfo
-	// DefaultOrder lists the non-ignored field indices in declaration order. Precomputed so a
-	// type that has not been optimized yet does not rebuild this slice for every record.
+	ID   int
+	Type reflect.Type
+	// Fields are the type's serializable fields, with embedded structs promoted. Every index used
+	// anywhere else — DefaultOrder, OptimizedOrder, the usage mask, the keys header — indexes into
+	// this slice, not into the Go struct's own fields.
+	Fields []FieldInfo
+	// DefaultOrder lists the field indices in declaration order. Precomputed so a type that has
+	// not been optimized yet does not rebuild this slice for every record.
 	DefaultOrder []int
 	// DefaultsBlock is the rendered {"field":<zero>,...} object for this type's non-omitempty
 	// fields, appended to the type's keys header entry when IncludeEmpty is on. Nil when the
@@ -103,36 +124,18 @@ func (r *FieldRegistry) GetID(t reflect.Type) int {
 	r.nextID++
 	r.typeToID[t] = id
 
-	xStruct := xunsafe.NewStruct(t)
-	fields := make([]FieldInfo, t.NumField())
-	defaultOrder := make([]int, 0, t.NumField())
-
-	for i := 0; i < t.NumField(); i++ {
-		sf := t.Field(i)
-		name, omitEmpty := parseFieldTag(sf)
-		ignored := name == "-"
-		if ignored {
-			name = sf.Name // Keep a name for debug, but mark ignored
-		}
-		fields[i] = FieldInfo{
-			Index:     i,
-			Name:      name,
-			RawName:   sf.Name,
-			Ignored:   ignored,
-			OmitEmpty: omitEmpty,
-		}
-		if !ignored {
-			defaultOrder = append(defaultOrder, i)
-		}
+	fields := promotedFields(t)
+	defaultOrder := make([]int, len(fields))
+	for i := range fields {
+		defaultOrder[i] = i
 	}
 
 	r.idToInfo[id] = &TypeInfo{
 		ID:            id,
 		Type:          t,
-		XStruct:       xStruct,
 		Fields:        fields,
 		DefaultOrder:  defaultOrder,
-		DefaultsBlock: buildDefaultsBlock(t),
+		DefaultsBlock: buildDefaultsBlock(fields),
 	}
 	return id
 }
@@ -150,9 +153,9 @@ func (r *FieldRegistry) freezeOrder(id int, usageCounts []int) {
 		return
 	}
 
-	// Sort non-ignored fields by how often they carried a non-zero value. Most-used first makes
-	// the always-zero fields cluster at the tail, where marshalStruct truncates them outright
-	// instead of spending a skip index on each one.
+	// Sort fields by how often they carried a non-zero value. Most-used first makes the
+	// always-zero fields cluster at the tail, where appendStruct truncates them outright instead
+	// of spending a skip index on each one.
 	order := append([]int(nil), info.DefaultOrder...)
 	sort.SliceStable(order, func(i, j int) bool {
 		return usageCounts[order[i]] > usageCounts[order[j]]
@@ -160,15 +163,6 @@ func (r *FieldRegistry) freezeOrder(id int, usageCounts []int) {
 
 	info.OptimizedOrder = order
 	info.IsOptimized = true
-}
-
-func (r *FieldRegistry) GetStruct(id int) *xunsafe.Struct {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if info, ok := r.idToInfo[id]; ok {
-		return info.XStruct
-	}
-	return nil
 }
 
 func (r *FieldRegistry) GetType(id int) reflect.Type {

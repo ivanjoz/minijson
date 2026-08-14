@@ -16,13 +16,13 @@ The Go package provides encoding and typed decoding. The `@ivanjoz/minijson` pac
 Go:
 
 ```sh
-go get github.com/ivanjoz/minijson@v0.2.0
+go get github.com/ivanjoz/minijson@v0.3.0
 ```
 
 TypeScript from GitHub:
 
 ```sh
-bun add @ivanjoz/minijson@github:ivanjoz/minijson#v0.2.0
+bun add @ivanjoz/minijson@github:ivanjoz/minijson#v0.3.0
 ```
 
 ## Go usage
@@ -97,9 +97,19 @@ The TypeScript decoder uses it to reconstruct the exact object `encoding/json` w
 
 The block costs one object per type per payload, not per record: 2000 records of a 10-field struct grow by 114 bytes. It is appended last and is the only object in an entry, and both header parsers read `(position, name)` pairs and stop at the last complete one, so a decoder that predates the block ignores it. Old and new clients can therefore be mixed while the flag is switched.
 
+## Agreement with encoding/json
+
+The contract is that a value produces the same JSON value through `Marshal` as it does through `encoding/json`. `TestDifferentialAgainstEncodingJSON` enforces it: it decodes each payload with no type information — the way the browser does — and diffs the result against `json.Marshal`. Add a case there whenever a new kind of field appears in a response type.
+
+That contract covers:
+
+- **Embedded structs are promoted.** An anonymous field without an explicit `json` name has its fields flattened into the parent, including transitively and through embedded pointers, with `encoding/json`'s shadowing rules (shallower wins; ties at the same depth resolve only if exactly one is tagged).
+- **`json.Marshaler` and `encoding.TextMarshaler` are honoured**, along with the matching unmarshalers, so a `time.Time` travels as `"2026-08-13T10:00:00Z"`.
+- **Unexported fields are skipped.**
+
 ### Known limitations
 
-`Marshal` does not honour `json.Marshaler` and does not skip unexported fields, so a `time.Time` field is written as its private internals rather than an RFC 3339 string, and typed decoding of one panics inside `reflect`. `TestTimeTimeIsMangled` pins this. Defaults inherit the same gap: the default for a `time.Time` field is `{}`.
+Only value-receiver `MarshalJSON`/`MarshalText` are honoured. A pointer-receiver marshaler on a non-addressable value is invisible to reflection, and `Marshal` receives its input through an `any`, so nothing is addressable at the top level. `time.Time`, `decimal.Decimal` and the `null.*` family all use value receivers.
 
 ## Development
 
