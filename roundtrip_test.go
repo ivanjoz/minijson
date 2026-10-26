@@ -158,3 +158,34 @@ func TestConcurrentMarshalIsolation(t *testing.T) {
 		}
 	}
 }
+
+type pointerPrimitiveRecord struct {
+	ID       int32    `json:"id,omitempty"`
+	Metadata *string  `json:"mdt,omitempty"`
+	Quantity *int32   `json:"qty,omitempty"`
+	Ratio    *float64 `json:"ratio,omitempty"`
+}
+
+// TestPointerPrimitiveRoundTrip guards decoding into pointer-to-primitive fields: the encoder
+// dereferences them, so the decoder must allocate the pointer back instead of failing with
+// "cannot set string to *string". Nil pointers must stay nil.
+func TestPointerPrimitiveRoundTrip(t *testing.T) {
+	metadata, quantity, ratio := "notes", int32(7), 1.5
+	records := []pointerPrimitiveRecord{
+		{ID: 1, Metadata: &metadata, Quantity: &quantity, Ratio: &ratio},
+		{ID: 2},
+	}
+
+	payload, err := minijson.Marshal(&records)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	decoded := []pointerPrimitiveRecord{}
+	if err := minijson.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(decoded, records) {
+		t.Fatalf("round trip mismatch:\n got  %+v\n want %+v", decoded, records)
+	}
+}

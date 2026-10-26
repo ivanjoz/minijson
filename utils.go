@@ -279,6 +279,17 @@ func setPrimitive(val reflect.Value, data any) error {
 		return nil
 	}
 
+	// Pointer to a primitive (*string, *int32...): the encoder writes the pointed-to value, so
+	// allocate a fresh target and decode into it. A null already returned the nil pointer above.
+	if val.Kind() == reflect.Ptr {
+		target := reflect.New(val.Type().Elem())
+		if err := setPrimitive(target.Elem(), data); err != nil {
+			return err
+		}
+		val.Set(target)
+		return nil
+	}
+
 	// Handle numeric conversions from float64 (JSON default)
 	if f, ok := data.(float64); ok {
 		switch val.Kind() {
