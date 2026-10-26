@@ -189,3 +189,40 @@ func TestPointerPrimitiveRoundTrip(t *testing.T) {
 		t.Fatalf("round trip mismatch:\n got  %+v\n want %+v", decoded, records)
 	}
 }
+
+type mirrorDetailRecord struct {
+	ID       int32  `json:"id,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Quantity int32  `json:"qty,omitempty"`
+}
+
+// TestDecodeIntoTypedMirrorStruct guards decoding into a struct other than the one encoded: a
+// handler returns a field as []any, and the caller decodes it into a mirror where that field is
+// typed. Fields must match by JSON name and take the destination's types, not the source's []any.
+func TestDecodeIntoTypedMirrorStruct(t *testing.T) {
+	source := struct {
+		Count   int32
+		Details []any
+	}{
+		Count:   2,
+		Details: []any{mirrorDetailRecord{ID: 1, Name: "a", Quantity: 3}, mirrorDetailRecord{ID: 2, Name: "b"}},
+	}
+
+	payload, err := minijson.Marshal(&source)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	decoded := struct {
+		Details []mirrorDetailRecord
+		Count   int32
+	}{}
+	if err := minijson.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+
+	wantDetails := []mirrorDetailRecord{{ID: 1, Name: "a", Quantity: 3}, {ID: 2, Name: "b"}}
+	if decoded.Count != 2 || !reflect.DeepEqual(decoded.Details, wantDetails) {
+		t.Fatalf("mirror decode mismatch: got %+v", decoded)
+	}
+}

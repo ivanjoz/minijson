@@ -1,6 +1,6 @@
 {
   "name": "@ivanjoz/minijson",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "TypeScript decoder for minijson's compact JSON array format",
   "type": "module",
   "types": "./javascript/index.ts",

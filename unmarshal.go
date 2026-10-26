@@ -16,6 +16,9 @@ type Decoder struct {
 	// and decoding never depends on the encoder's registry state. Nil when Unmarshal is called
 	// on bare content with no header.
 	fieldOrderByType map[int][]int
+	// destinationFieldsByType caches, per destination struct type, its fields keyed by JSON name.
+	// Only used when a payload's source type differs from the struct it is decoded into.
+	destinationFieldsByType map[reflect.Type]map[string]*FieldInfo
 }
 
 func NewDecoder() *Decoder {
@@ -254,7 +257,7 @@ func (d *Decoder) unmarshalStruct(arr []any, val reflect.Value) error {
 		if val.Kind() == reflect.Ptr {
 			// Handle pointer types
 			if val.IsNil() {
-				val.Set(reflect.New(d.lastType))
+				val.Set(reflect.New(val.Type().Elem()))
 			}
 			return d.populateStruct(typeID, arr[valueStartIdx:], skipIndices, val.Elem())
 		}
@@ -268,6 +271,14 @@ func (d *Decoder) populateStruct(typeID int, values []any, skipIndices []int, va
 	typeInfo := d.registry.GetTypeInfo(typeID)
 	if typeInfo == nil {
 		return fmt.Errorf("unknown type ID: %d", typeID)
+	}
+
+	// The payload names the type it was encoded from, but the destination can be a different struct
+	// with the same JSON shape — e.g. a typed mirror of a handler struct whose field is []any. Then
+	// the destination's own fields are matched by JSON name, so values decode into their real types.
+	var destinationFields map[string]*FieldInfo
+	if val.Type() != typeInfo.Type {
+		destinationFields = d.destinationFieldsFor(val.Type())
 	}
 
 	skipMap := make(map[int]bool)
@@ -304,6 +315,14 @@ func (d *Decoder) populateStruct(typeID int, values []any, skipIndices []int, va
 		}
 
 		field := &typeInfo.Fields[fieldIdx]
+		if destinationFields != nil {
+			destinationField, found := destinationFields[field.Name]
+			if !found {
+				valueIdx++
+				continue
+			}
+			field = destinationField
+		}
 		// Resolve the destination before decoding into it: a promoted field may sit behind a nil
 		// embedded pointer that has to be allocated first, and an unsettable one has nowhere to go.
 		target, settable := fieldByIndexPathAlloc(val, field.IndexPath)
@@ -326,6 +345,22 @@ func (d *Decoder) populateStruct(typeID int, values []any, skipIndices []int, va
 		valueIdx++
 	}
 	return nil
+}
+
+func (d *Decoder) destinationFieldsFor(destinationType reflect.Type) map[string]*FieldInfo {
+	if fields, cached := d.destinationFieldsByType[destinationType]; cached {
+		return fields
+	}
+	destinationInfo := d.registry.GetTypeInfo(d.registry.GetID(destinationType))
+	fields := make(map[string]*FieldInfo, len(destinationInfo.Fields))
+	for i := range destinationInfo.Fields {
+		fields[destinationInfo.Fields[i].Name] = &destinationInfo.Fields[i]
+	}
+	if d.destinationFieldsByType == nil {
+		d.destinationFieldsByType = map[reflect.Type]map[string]*FieldInfo{}
+	}
+	d.destinationFieldsByType[destinationType] = fields
+	return fields
 }
 
 func (d *Decoder) unmarshalSlice(arr []any, val reflect.Value) error {
